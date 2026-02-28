@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
 Job Search Tracker — Streamlit app.
-SQLite backend · keyword extraction · PDF resume matcher.
+PostgreSQL (Supabase) or SQLite backend · auth · keyword extraction · PDF resume matcher.
 """
 
+import base64
+import hashlib
 import html as _html
 import io
 import json
 import re
+import secrets as _secrets
 import sqlite3
 from collections import Counter
 from datetime import datetime
@@ -48,19 +51,125 @@ STOP_WORDS = {
 }
 
 
-# ── Database ──────────────────────────────────────────────────────────────
+# ── Database abstraction (PostgreSQL on Streamlit Cloud, SQLite locally) ──
+
+def _is_pg() -> bool:
+    """True when a DATABASE_URL secret is configured (Supabase / Neon / etc.)."""
+    try:
+        return bool(st.secrets.get("DATABASE_URL"))
+    except Exception:
+        return False
+
 
 def get_conn():
+    """Return a live database connection for the active backend."""
+    if _is_pg():
+        import psycopg2
+        return psycopg2.connect(st.secrets["DATABASE_URL"])
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _run_sql(sql: str, params=(), *, fetch=None):
+    """
+    Execute *sql* against the active database and return results.
+
+    Placeholders in *sql* must always be written as ``?``; they are
+    automatically translated to ``%s`` for PostgreSQL at call time.
+
+    fetch options
+    -------------
+    None   – write-only (INSERT / UPDATE / DELETE)
+    "one"  – return a single row as dict, or None
+    "all"  – return a list of row dicts (may be empty)
+    "id"   – return the id of the last-inserted row
+    """
+    pg = _is_pg()
+    if pg:
+        sql = sql.replace("?", "%s")
+
+    conn = get_conn()
+    try:
+        if pg:
+            import psycopg2.extras
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(sql, params if params else None)
+            if fetch == "one":
+                row = cur.fetchone()
+                result = dict(row) if row else None
+            elif fetch == "all":
+                result = [dict(r) for r in cur.fetchall()]
+            elif fetch == "id":
+                row = cur.fetchone()
+                result = row["id"] if row else None
+            else:
+                result = None
+            conn.commit()
+            cur.close()
+        else:
+            cur = conn.execute(sql, params)
+            if fetch == "one":
+                row = cur.fetchone()
+                result = dict(row) if row else None
+            elif fetch == "all":
+                result = [dict(r) for r in cur.fetchall()]
+            elif fetch == "id":
+                result = cur.lastrowid
+            else:
+                result = None
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return result
+
+
+# ── Schema ────────────────────────────────────────────────────────────────
+
 def init_db():
-    with get_conn() as conn:
-        conn.execute("""
+    """Create tables if they don't exist; migrate SQLite if needed."""
+    if _is_pg():
+        _run_sql("""
+            CREATE TABLE IF NOT EXISTS users (
+                id          SERIAL PRIMARY KEY,
+                username    VARCHAR(50) UNIQUE NOT NULL,
+                salt        TEXT        NOT NULL,
+                hash        TEXT        NOT NULL,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        _run_sql("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id          SERIAL PRIMARY KEY,
+                user_id     INTEGER     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title       TEXT        NOT NULL,
+                company     TEXT        NOT NULL,
+                location    TEXT        DEFAULT '',
+                url         TEXT        DEFAULT '',
+                salary      TEXT        DEFAULT '',
+                status      TEXT        DEFAULT 'Interested',
+                description TEXT        DEFAULT '',
+                notes       TEXT        DEFAULT '',
+                date_added  TEXT        DEFAULT (CURRENT_DATE)
+            )
+        """)
+    else:
+        _run_sql("""
+            CREATE TABLE IF NOT EXISTS users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                username    TEXT    UNIQUE NOT NULL,
+                salt        TEXT    NOT NULL,
+                hash        TEXT    NOT NULL,
+                created_at  TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        _run_sql("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER,
                 title       TEXT    NOT NULL,
                 company     TEXT    NOT NULL,
                 location    TEXT    DEFAULT '',
@@ -72,20 +181,93 @@ def init_db():
                 date_added  TEXT    DEFAULT (date('now'))
             )
         """)
+        # Migrate pre-existing SQLite DB: add user_id if missing
+        try:
+            _run_sql("ALTER TABLE jobs ADD COLUMN user_id INTEGER")
+        except Exception:
+            pass  # column already exists
 
 
-def add_job(title, company, location, url, salary, status, description, notes):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO jobs (title,company,location,url,salary,status,description,notes) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (title, company, location, url, salary, status, description, notes),
+# ── Password hashing ──────────────────────────────────────────────────────
+
+def _hash_pw(password: str, salt_bytes: bytes = None):
+    """Return (b64_salt, b64_hash) using PBKDF2-HMAC-SHA256."""
+    if salt_bytes is None:
+        salt_bytes = _secrets.token_bytes(32)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, 260_000)
+    return base64.b64encode(salt_bytes).decode(), base64.b64encode(dk).decode()
+
+
+def _verify_pw(password: str, stored_salt: str, stored_hash: str) -> bool:
+    salt = base64.b64decode(stored_salt)
+    _, computed = _hash_pw(password, salt)
+    return _secrets.compare_digest(computed, stored_hash)
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────
+
+def create_user(username: str, password: str):
+    """
+    Create a new user account.
+    Returns (user_id, None) on success, or (None, error_message) on failure.
+    """
+    username = username.strip().lower()
+    if len(username) < 3:
+        return None, "Username must be at least 3 characters."
+    if len(username) > 50:
+        return None, "Username must be 50 characters or fewer."
+    if not re.match(r'^[a-z0-9_.-]+$', username):
+        return None, "Username may only contain letters, numbers, . _ -"
+    if len(password) < 6:
+        return None, "Password must be at least 6 characters."
+
+    if _run_sql("SELECT id FROM users WHERE username = ?", (username,), fetch="one"):
+        return None, "That username is already taken."
+
+    salt, hsh = _hash_pw(password)
+    if _is_pg():
+        user_id = _run_sql(
+            "INSERT INTO users (username, salt, hash) VALUES (?, ?, ?) RETURNING id",
+            (username, salt, hsh),
+            fetch="id",
         )
+    else:
+        user_id = _run_sql(
+            "INSERT INTO users (username, salt, hash) VALUES (?, ?, ?)",
+            (username, salt, hsh),
+            fetch="id",
+        )
+    return user_id, None
 
 
-def get_jobs(status_f="All", company_f="All", location_f="All"):
+def verify_credentials(username: str, password: str):
+    """Return user_id if credentials are valid, else None."""
+    row = _run_sql(
+        "SELECT id, salt, hash FROM users WHERE username = ?",
+        (username.strip().lower(),),
+        fetch="one",
+    )
+    if not row:
+        return None
+    return row["id"] if _verify_pw(password, row["salt"], row["hash"]) else None
+
+
+# ── Job CRUD ──────────────────────────────────────────────────────────────
+
+def add_job(title, company, location, url, salary, status, description, notes, user_id):
+    _run_sql(
+        "INSERT INTO jobs "
+        "(title,company,location,url,salary,status,description,notes,user_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (title, company, location, url, salary, status, description, notes, user_id),
+    )
+
+
+def get_jobs(status_f="All", company_f="All", location_f="All", user_id=None):
     q = "SELECT * FROM jobs WHERE 1=1"
     params = []
+    if user_id is not None:
+        q += " AND user_id=?"; params.append(user_id)
     if status_f != "All":
         q += " AND status=?"; params.append(status_f)
     if company_f != "All":
@@ -93,24 +275,26 @@ def get_jobs(status_f="All", company_f="All", location_f="All"):
     if location_f != "All":
         q += " AND location=?"; params.append(location_f)
     q += " ORDER BY date_added DESC"
-    with get_conn() as conn:
-        return [dict(r) for r in conn.execute(q, params).fetchall()]
+    return _run_sql(q, params, fetch="all") or []
 
 
-def update_job_status(job_id, status):
-    with get_conn() as conn:
-        conn.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
+def update_job_status(job_id, status, user_id):
+    _run_sql(
+        "UPDATE jobs SET status=? WHERE id=? AND user_id=?",
+        (status, job_id, user_id),
+    )
 
 
-def delete_job(job_id):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+def delete_job(job_id, user_id):
+    _run_sql("DELETE FROM jobs WHERE id=? AND user_id=?", (job_id, user_id))
 
 
-def get_job(job_id):
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-        return dict(row) if row else None
+def get_job(job_id, user_id):
+    return _run_sql(
+        "SELECT * FROM jobs WHERE id=? AND user_id=?",
+        (job_id, user_id),
+        fetch="one",
+    )
 
 
 # ── Keyword helpers ───────────────────────────────────────────────────────
@@ -700,6 +884,83 @@ st.markdown("""
 init_db()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# AUTH GATE — show login/signup if not authenticated
+# ══════════════════════════════════════════════════════════════════════════
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+    st.session_state.username = ""
+
+if not st.session_state.user_id:
+    st.markdown(
+        '<h1 style="text-align:center;margin-bottom:0.25rem;">💼 Job Tracker</h1>'
+        '<p style="text-align:center;color:#718096;margin-bottom:2rem;">Track every application, all in one place.</p>',
+        unsafe_allow_html=True,
+    )
+
+    _, auth_col, _ = st.columns([1, 1.6, 1])
+    with auth_col:
+        signin_tab, signup_tab = st.tabs(["Sign In", "Sign Up"])
+
+        with signin_tab:
+            with st.form("signin_form"):
+                si_user = st.text_input("Username", key="si_user")
+                si_pass = st.text_input("Password", type="password", key="si_pass")
+                si_btn  = st.form_submit_button("Sign In", use_container_width=True, type="primary")
+            if si_btn:
+                if not si_user or not si_pass:
+                    st.error("Please enter both username and password.")
+                else:
+                    uid = verify_credentials(si_user, si_pass)
+                    if uid:
+                        st.session_state.user_id  = uid
+                        st.session_state.username = si_user.strip().lower()
+                        st.rerun()
+                    else:
+                        st.error("Incorrect username or password.")
+
+        with signup_tab:
+            with st.form("signup_form"):
+                su_user  = st.text_input("Choose a username", key="su_user")
+                su_pass  = st.text_input("Choose a password (min 6 chars)", type="password", key="su_pass")
+                su_pass2 = st.text_input("Confirm password", type="password", key="su_pass2")
+                su_btn   = st.form_submit_button("Create Account", use_container_width=True, type="primary")
+            if su_btn:
+                if su_pass != su_pass2:
+                    st.error("Passwords do not match.")
+                else:
+                    uid, err = create_user(su_user, su_pass)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.user_id  = uid
+                        st.session_state.username = su_user.strip().lower()
+                        st.rerun()
+
+    st.stop()  # Don't render anything below until logged in
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN APP — only reached when authenticated
+# ══════════════════════════════════════════════════════════════════════════
+
+uid = st.session_state.user_id  # convenience alias used in every DB call
+
+# ── Header with logout ────────────────────────────────────────────────────
+hdr_left, hdr_right = st.columns([6, 1])
+with hdr_left:
+    st.markdown(
+        f'<p style="color:#718096;font-size:0.85rem;margin:0;">👤 signed in as '
+        f'<strong style="color:#a78bfa">{st.session_state.username}</strong></p>',
+        unsafe_allow_html=True,
+    )
+with hdr_right:
+    if st.button("Sign Out", use_container_width=True):
+        for key in ("user_id", "username", "fetched_job", "fetch_url", "job_saved_msg"):
+            st.session_state.pop(key, None)
+        st.rerun()
+
 # ── Tabs ──────────────────────────────────────────────────────────────────
 
 tab_board, tab_add, tab_match = st.tabs(["📋  Job Board", "➕  Add Job", "🔍  Resume Match"])
@@ -712,7 +973,7 @@ tab_board, tab_add, tab_match = st.tabs(["📋  Job Board", "➕  Add Job", "�
 with tab_board:
     st.markdown("## 💼 Job Board")
 
-    all_jobs = get_jobs()
+    all_jobs = get_jobs(user_id=uid)
 
     if not all_jobs:
         st.info("No jobs saved yet. Go to **Add Job** to get started.")
@@ -745,7 +1006,7 @@ with tab_board:
         with fs:
             status_f   = st.selectbox("Status",   ["All"] + STATUSES, key="bf_status")
 
-        filtered = get_jobs(status_f, company_f, location_f)
+        filtered = get_jobs(status_f, company_f, location_f, user_id=uid)
 
         st.markdown(f"**{len(filtered)} job{'s' if len(filtered)!=1 else ''}**")
         st.markdown("---")
@@ -781,11 +1042,11 @@ with tab_board:
                         label_visibility="collapsed",
                     )
                     if new_status != job["status"]:
-                        update_job_status(job["id"], new_status)
+                        update_job_status(job["id"], new_status, uid)
                         st.rerun()
 
                     if st.button("🗑 Delete", key=f"del_{job['id']}"):
-                        delete_job(job["id"])
+                        delete_job(job["id"], uid)
                         st.rerun()
 
                 # Expandable details
@@ -893,7 +1154,7 @@ with tab_add:
         if not title or not company:
             st.error("Job Title and Company are required.")
         else:
-            add_job(title, company, location, url, salary, status, description, notes)
+            add_job(title, company, location, url, salary, status, description, notes, uid)
             st.session_state.fetched_job = {}
             st.session_state.fetch_url = ""
             # Store banner in session state, then rerun so Job Board picks up the new row
@@ -908,7 +1169,7 @@ with tab_add:
 with tab_match:
     st.markdown("## 🔍 Resume Keyword Matcher")
 
-    all_jobs = get_jobs()
+    all_jobs = get_jobs(user_id=uid)
     jobs_with_jd = [j for j in all_jobs if j["description"] and j["description"].strip()]
 
     if not jobs_with_jd:
@@ -920,7 +1181,7 @@ with tab_match:
             job_options = {f'{j["title"]} — {j["company"]}': j["id"] for j in jobs_with_jd}
             selected_label = st.selectbox("Select a job to match against", list(job_options.keys()))
             selected_id = job_options[selected_label]
-            job = get_job(selected_id)
+            job = get_job(selected_id, uid)
 
             resume_file = st.file_uploader("Upload your resume (PDF)", type=["pdf"])
 

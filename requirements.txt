@@ -6,3 +6,4 @@ beautifulsoup4
 lxml
 wordcloud
 matplotlib
+psycopg2-binary

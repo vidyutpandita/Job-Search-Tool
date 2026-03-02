@@ -600,6 +600,8 @@ _JS_REQUIRED_SITES = {
     "metacareers.com", "linkedin.com", "indeed.com",
     "careers.google.com", "jobs.lever.co",
     "myworkdayjobs.com", "smartrecruiters.com",
+    "careers.microsoft.com", "jobs.careers.microsoft.com",
+    "apply.careers.microsoft.com",
 }
 
 
